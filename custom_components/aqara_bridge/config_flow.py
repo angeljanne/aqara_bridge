@@ -3,21 +3,18 @@ import voluptuous as vol
 import homeassistant.helpers.config_validation as cv
 from homeassistant import config_entries
 
-from . import init_hass_data, data_masking, gen_auth_entry
+from . import data_masking, GLOBAL_DATA_MANAGER
 from .const import (
+    CONF_FIELD_EXCLUDE_DEVICES,
     DOMAIN,
     CONF_FIELD_ACCOUNT,
     CONF_FIELD_COUNTRY_CODE,
     CONF_FIELD_AUTH_CODE,
-    CONF_FIELD_SELECTED_DEVICES,
     CONF_FIELD_REFRESH_TOKEN,
     CONF_ENTRY_AUTH_ACCOUNT,
-    HASS_DATA_AIOTCLOUD,
-    HASS_DATA_AIOT_MANAGER,
     SERVER_COUNTRY_CODES,
     SERVER_COUNTRY_CODES_DEFAULT,
     CONF_ENTRY_AUTH_ACCOUNT,
-    HASS_DATA_AUTH_ENTRY_ID,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -45,22 +42,14 @@ class AqaraBridgeFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
         self.account = None
         self.country_code = None
         self.account_type = None
-        self._session = None
-        self._device_manager = None
+        self._auth = None
 
     async def async_step_user(self, user_input=None):
         """Handle a flow initialized by the user."""
-        init_hass_data(self.hass)
-        self._device_manager = self.hass.data[DOMAIN][HASS_DATA_AIOT_MANAGER]
-        auth_entry_id = self.hass.data[DOMAIN][HASS_DATA_AUTH_ENTRY_ID]
-        self._session = self.hass.data[DOMAIN][HASS_DATA_AIOTCLOUD]
-        if auth_entry_id:
-            return await self.async_step_select_devices()
+        GLOBAL_DATA_MANAGER.init_data(self.hass)
+        if GLOBAL_DATA_MANAGER.entry:
+            return await self.async_step_exclude_devices()
         else:
-            # self._session = AiotCloud(
-            #     aiohttp_client.async_create_clientsession(self.hass)
-            # )
-            # self.hass.data[DOMAIN][HASS_DATA_AIOTCLOUD] = self._session
             return await self.async_step_get_auth_code()
 
     async def async_step_get_auth_code(self, user_input=None):
@@ -70,29 +59,28 @@ class AqaraBridgeFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
             self.account = user_input.get(CONF_FIELD_ACCOUNT)
             self.country_code = user_input.get(CONF_FIELD_COUNTRY_CODE)
             self.account_type = 0
-            self._session.set_country(self.country_code)
+            GLOBAL_DATA_MANAGER.session.set_country(self.country_code)
 
             refresh_token = user_input.get(CONF_FIELD_REFRESH_TOKEN)
             if refresh_token and refresh_token != "":
-                resp = await self._session.async_refresh_token(refresh_token)
+                resp = await GLOBAL_DATA_MANAGER.session.async_refresh_token(
+                    refresh_token
+                )
                 if resp["code"] == 0:
-                    auth_entry = gen_auth_entry(
+                    self._auth = GLOBAL_DATA_MANAGER.create_token_data(
                         self.account,
                         self.account_type,
                         self.country_code,
                         resp["result"],
                     )
-                    self.hass.async_add_job(
-                        self.hass.config_entries.flow.async_init(
-                            DOMAIN, context={"source": "get_token"}, data=auth_entry
-                        )
-                    )
-                    return await self.async_step_select_devices()
+                    return await self.async_step_exclude_devices()
                 else:
                     # TODO 这里要处理API失败的情况
                     pass
             else:
-                resp = await self._session.async_get_auth_code(self.account, 0)
+                resp = await GLOBAL_DATA_MANAGER.session.async_get_auth_code(
+                    self.account, 0
+                )
                 if resp["code"] == 0:
                     return await self.async_step_get_token()
                 else:
@@ -108,70 +96,50 @@ class AqaraBridgeFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
     async def async_step_get_token(self, user_input=None):
         errors = {}
         if user_input:
-            if CONF_FIELD_AUTH_CODE in user_input:
-                auth_code = user_input.get(CONF_FIELD_AUTH_CODE)
-                resp = await self._session.async_get_token(auth_code, self.account, 0)
+            auth_code = user_input.get(CONF_FIELD_AUTH_CODE)
+            resp = await GLOBAL_DATA_MANAGER.session.async_get_token(
+                auth_code, self.account, 0
+            )
 
-                if resp["code"] == 0:
-                    auth_entry = gen_auth_entry(
-                        self.account,
-                        self.account_type,
-                        self.country_code,
-                        resp["result"],
-                    )
-                    self.hass.async_add_job(
-                        self.hass.config_entries.flow.async_init(
-                            DOMAIN, context={"source": "get_token"}, data=auth_entry
-                        )
-                    )
-                else:
-                    errors["base"] = "cloud_credentials_incomplete"
-            elif CONF_ENTRY_AUTH_ACCOUNT in user_input:
-                return self.async_create_entry(
-                    title=data_masking(user_input[CONF_ENTRY_AUTH_ACCOUNT], 4),
-                    data=user_input,
+            if resp["code"] == 0:
+                self._auth = GLOBAL_DATA_MANAGER.create_token_data(
+                    self.account,
+                    self.account_type,
+                    self.country_code,
+                    resp["result"],
                 )
+            else:
+                errors["base"] = "cloud_credentials_incomplete"
 
-            return await self.async_step_select_devices()
+            if self._auth:
+                return await self.async_step_exclude_devices()
 
         return self.async_show_form(
             step_id="get_token", data_schema=DEVICE_GET_TOKEN_CONFIG, errors=errors
         )
 
-    async def async_step_select_devices(self, user_input=None):
+    async def async_step_exclude_devices(self, user_input=None):
         errors = {}
         if user_input:
-            if CONF_FIELD_SELECTED_DEVICES in user_input:
-                dids = user_input[CONF_FIELD_SELECTED_DEVICES]
-                devices = await self._session.async_query_device_info(dids)
-                for device in devices:
-                    self.hass.async_add_job(
-                        self.hass.config_entries.flow.async_init(
-                            DOMAIN, context={"source": "select_devices"}, data=device
-                        )
-                    )
-            elif "did" in user_input:
-                await self.async_set_unique_id(
-                    user_input["did"], raise_on_progress=False
-                )
+            if CONF_FIELD_EXCLUDE_DEVICES in user_input:
+                dids = user_input[CONF_FIELD_EXCLUDE_DEVICES]
                 return self.async_create_entry(
-                    title=user_input["deviceName"], data=user_input
+                    title=data_masking(self._auth[CONF_ENTRY_AUTH_ACCOUNT], 4),
+                    data=dict({"excluded_dids": dids}, **self._auth),
                 )
-
-            return self.async_abort(reason="complete")
-
+                # return self.async_abort(reason="complete")
+        await GLOBAL_DATA_MANAGER.aiot_manager.async_refresh_all_devices()
         devlist = {}
-        await self._device_manager.async_refresh_all_devices()  # 刷新一下
         [
             devlist.setdefault(x.did, f"{x.device_name} - {x.model}")
-            for x in self._device_manager.unmanaged_gateways
+            for x in GLOBAL_DATA_MANAGER.aiot_manager.supported_devices
         ]
         return self.async_show_form(
-            step_id="select_devices",
+            step_id="exclude_devices",
             data_schema=vol.Schema(
                 {
                     vol.Required(
-                        CONF_FIELD_SELECTED_DEVICES, default=[]
+                        CONF_FIELD_EXCLUDE_DEVICES, default=[]
                     ): cv.multi_select(devlist)
                 }
             ),

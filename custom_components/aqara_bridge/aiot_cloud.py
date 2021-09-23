@@ -150,7 +150,7 @@ class AiotCloud:
             self.access_token = jo["result"]["accessToken"]
             self.refresh_token = jo["result"]["refreshToken"]
             if self.update_token_event_callback:
-                self.update_token_event_callback(self.access_token, self.refresh_token)
+                self.update_token_event_callback(jo)
 
         return jo
 
@@ -165,7 +165,7 @@ class AiotCloud:
             self.access_token = jo["result"]["accessToken"]
             self.refresh_token = jo["result"]["refreshToken"]
             if self.update_token_event_callback:
-                self.update_token_event_callback(self.access_token, self.refresh_token)
+                self.update_token_event_callback(jo)
 
         return jo
 

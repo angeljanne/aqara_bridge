@@ -2,23 +2,17 @@ import logging
 import homeassistant.util.color as color_util
 from homeassistant.components.light import LightEntity
 
-from .aiot_manager import (
-    AiotManager,
-    AiotToggleableEntityBase,
-)
-from .const import DOMAIN, HASS_DATA_AIOT_MANAGER
+from . import GLOBAL_DATA_MANAGER
+from .aiot_manager import AiotToggleableEntityBase
 
 TYPE = "light"
 
 _LOGGER = logging.getLogger(__name__)
 
-DATA_KEY = f"{TYPE}.{DOMAIN}"
-
 
 async def async_setup_entry(hass, config_entry, async_add_entities):
-    manager: AiotManager = hass.data[DOMAIN][HASS_DATA_AIOT_MANAGER]
-    await manager.async_add_entities(
-        config_entry, TYPE, AiotLightEntity, async_add_entities
+    await GLOBAL_DATA_MANAGER.aiot_manager.async_add_entities(
+        TYPE, AiotLightEntity, async_add_entities
     )
 
 

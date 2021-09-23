@@ -24,11 +24,11 @@
                 "description": "请输入短信验证码。",
                 "title": "登录到Aqara云服务平台"
             },
-            "select_devices": {
-                "data": {
-                    "field_selected_devices": "选择设备"
+            "exclude_devices":{
+                "data":{
+                    "field_exclude_devices": "选择排除的设备"
                 },
-                "description": "从列表中选择需要绑定的设备。",
+                "description": "从列表中选择需要排除的设备，若要添加所有设备，请留空。",
                 "title": "从Aqara云服务平台绑定设备"
             }
         }

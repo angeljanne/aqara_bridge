@@ -1,4 +1,5 @@
 import asyncio
+import datetime
 import json
 import logging
 import time
@@ -7,6 +8,9 @@ from homeassistant.core import HomeAssistant
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.helpers.entity import DeviceInfo, Entity
 from rocketmq.client import PushConsumer, RecvMessage
+from homeassistant.helpers import aiohttp_client
+
+from .aiot_cloud import AiotCloud
 
 from .aiot_cloud import AiotCloud, APP_ID, KEY_ID, APP_KEY
 from .aiot_mapping import (
@@ -15,7 +19,18 @@ from .aiot_mapping import (
     MK_RESOURCES,
     AIOT_DEVICE_MAPPING,
 )
-from .const import DOMAIN, HASS_DATA_AIOT_MANAGER
+from .const import (
+    DOMAIN,
+    CONF_ENTRY_AUTH_ACCOUNT,
+    CONF_ENTRY_AUTH_ACCOUNT_TYPE,
+    CONF_ENTRY_AUTH_COUNTRY_CODE,
+    CONF_ENTRY_AUTH_EXPIRES_IN,
+    CONF_ENTRY_AUTH_EXPIRES_TIME,
+    CONF_ENTRY_AUTH_ACCESS_TOKEN,
+    CONF_ENTRY_AUTH_REFRESH_TOKEN,
+    CONF_ENTRY_AUTH_OPENID,
+    CONF_ENTRY_EXCLUDED_DIDS,
+)
 
 
 _LOGGER = logging.getLogger(__name__)
@@ -75,13 +90,10 @@ class AiotEntityBase(Entity):
         self._attr_unit_of_measurement = kwargs.get("unit_of_measurement")
         self._attr_device_class = kwargs.get("device_class")
 
-        self._aiot_manager: AiotManager = hass.data[DOMAIN][HASS_DATA_AIOT_MANAGER]
-
     _channel = None
     _device = None
     _res_params = None
     _supported_resources = None
-    _aiot_manager = None
 
     @property
     def channel(self) -> int:
@@ -101,7 +113,7 @@ class AiotEntityBase(Entity):
     async def async_set_res_value(self, res_name, value):
         """设置资源值"""
         res_id = self.get_res_id_by_name(res_name)
-        return await self._aiot_manager.session.async_write_resource_device(
+        return await GLOBAL_DATA_MANAGER.session.async_write_resource_device(
             self.device.did, res_id, value
         )
 
@@ -115,7 +127,7 @@ class AiotEntityBase(Entity):
                 res_ids.append(self.get_res_id_by_name(k))
                 for k, v in self._res_params.items()
             ]
-        return await self._aiot_manager.session.async_query_resource_value(
+        return await GLOBAL_DATA_MANAGER.session.async_query_resource_value(
             self.device.did, res_ids
         )
 
@@ -211,14 +223,9 @@ class AiotMessageHandler:
 
 
 class AiotManager:
-    def __init__(self, hass: HomeAssistant, session: AiotCloud):
-        self._hass = hass
-        self._session = session
+    def __init__(self):
         self._msg_handler = AiotMessageHandler(asyncio.get_event_loop())
         self._msg_handler.start(self._msg_callback)
-
-    # Aiot会话
-    _session: AiotCloud = None
 
     # 所有设备
     _all_devices: dict[str, list[AiotDevice]] = {}
@@ -226,22 +233,11 @@ class AiotManager:
     # 所有在HA中管理的设备
     _managed_devices: dict[str, AiotDevice] = {}
 
-    # 配置对象和设备的对应关系，1：N
-    _entries_devices: dict[str, list[str]] = {}
-
-    # 所有配置对象
-    _config_entries: dict[str, ConfigEntry] = {}
-
     # 设备和实体的对应关系，1：N
     _devices_entities: dict[str, list[AiotEntityBase]] = {}
 
     # 插件不支持的设备列表
     _unsupported_devices: list[AiotDevice] = []
-
-    @property
-    def session(self) -> AiotCloud:
-        """与Aiot建立的会话"""
-        return self._session
 
     @property
     def all_devices(self) -> list[AiotDevice]:
@@ -254,7 +250,7 @@ class AiotManager:
         gateways = []
         [
             gateways.append(x)
-            for x in self._all_devices.values()
+            for x in self.all_devices
             if x.model_type in (1, 2) and x.did not in self._managed_devices.keys()
         ]
         return gateways
@@ -263,7 +259,14 @@ class AiotManager:
     def unsupported_devices(self) -> list[AiotDevice]:
         """插件不支持的设备列表"""
         devices = []
-        [devices.append(x) for x in self._all_devices.values() if not x.is_supported]
+        [devices.append(x) for x in self.all_devices if not x.is_supported]
+        return devices
+
+    @property
+    def supported_devices(self) -> list[AiotDevice]:
+        """插件支持的设备列表"""
+        devices = []
+        [devices.append(x) for x in self.all_devices if x.is_supported]
         return devices
 
     async def _msg_callback(self, msg):
@@ -280,72 +283,36 @@ class AiotManager:
     async def async_refresh_all_devices(self):
         """获取Aiot所有设备"""
         self._all_devices = {}
-        results = await self._session.async_query_all_devices_info()
+        results = await GLOBAL_DATA_MANAGER.session.async_query_all_devices_info()
         [self._all_devices.setdefault(x["did"], AiotDevice(**x)) for x in results]
 
-    async def async_add_devices(
-        self,
-        config_entry: ConfigEntry,
-        devices: list[AiotDevice],
-        auto_add_sub_devices=False,
-    ):
+    async def async_add_devices(self, config_entry: ConfigEntry):
+        excluded_dids = config_entry.data.get(CONF_ENTRY_EXCLUDED_DIDS)
         await self.async_refresh_all_devices()  # 刷新一次所有设备列表
-        self._entries_devices.setdefault(config_entry.entry_id, [])
-        self._config_entries[config_entry.entry_id] = config_entry
-        for device in devices:
-            # 这里看情况检查did是否已经存在，理论上来说应该不会重复，现在代码未做重复判断
-            if device.is_supported:
+        for device in self.supported_devices:
+            if device.did not in excluded_dids:
                 self._managed_devices[device.did] = device
-                self._entries_devices[config_entry.entry_id].append(device.did)
-                if auto_add_sub_devices and device.model_type == 1:
-                    sub_devices = []
-                    [
-                        sub_devices.append(x)
-                        for x in self.all_devices
-                        if x.parent_did == device.did
-                    ]
-                    for sub_device in sub_devices:
-                        if sub_device.is_supported:
-                            device.children.append(sub_device)
-                            self._managed_devices[sub_device.did] = sub_device
-                            self._entries_devices[config_entry.entry_id].append(
-                                sub_device.did
-                            )
-                        else:
-                            _LOGGER.warn(
-                                f"Aqara device is not supported. Deivce model is '{sub_device.model}'."
-                            )
-            else:
-                _LOGGER.warn(
-                    f"Aqara device is not supported. Deivce model is '{device.model}'."
-                )
-                continue
 
     async def async_forward_entry_setup(self, config_entry: ConfigEntry):
-        devices_in_entry = self._entries_devices[config_entry.entry_id]
         platforms = []
-        [
-            platforms.extend(self._managed_devices[x].platforms)
-            for x in devices_in_entry
-            if self._managed_devices[x].is_supported
-        ]
+        [platforms.extend(v.platforms) for k, v in self._managed_devices.items()]
         platforms = set(platforms)
         [
-            self._hass.async_create_task(
-                self._hass.config_entries.async_forward_entry_setup(config_entry, x)
+            GLOBAL_DATA_MANAGER.hass.async_create_task(
+                GLOBAL_DATA_MANAGER.hass.config_entries.async_forward_entry_setup(
+                    config_entry, x
+                )
             )
             for x in platforms
         ]
 
-    async def async_add_entities(
-        self, config_entry: ConfigEntry, entity_type: str, t, async_add_entities
-    ):
+    async def async_add_entities(self, entity_type: str, t, async_add_entities):
         """根据ConfigEntry创建Entity"""
         devices = []
         [
-            devices.append(self._managed_devices[x])
-            for x in self._entries_devices[config_entry.entry_id]
-            if entity_type in self._managed_devices[x].platforms
+            devices.append(v)
+            for k, v in self._managed_devices.items()
+            if entity_type in v.platforms
         ]
         entities = []
         for device in devices:
@@ -355,7 +322,7 @@ class AiotManager:
             # 这里需要处理特殊设备
             if device.model == "lumi.airrtc.vrfegl01":
                 # VRF空调控制器
-                resp = await self._session.async_query_resource_value(
+                resp = await GLOBAL_DATA_MANAGER.session.async_query_resource_value(
                     device.did, ["13.1.85"]
                 )
                 ch_count = int(resp[0]["value"])
@@ -366,7 +333,7 @@ class AiotManager:
             if ch_count:
                 for i in range(ch_count):
                     instance = t(
-                        self._hass,
+                        GLOBAL_DATA_MANAGER.hass,
                         device,
                         params[MK_RESOURCES],
                         i + 1,
@@ -376,7 +343,7 @@ class AiotManager:
                     entities.append(instance)
             else:
                 instance = t(
-                    self._hass,
+                    GlobalDataManager.hass,
                     device,
                     params[MK_RESOURCES],
                     **params.get(MK_INIT_PARAMS) or {},
@@ -386,10 +353,125 @@ class AiotManager:
 
         async_add_entities(entities, update_before_add=True)
 
-    async def async_remove_entry(self, config_entry):
+    async def async_remove_entry(self):
         """ConfigEntry remove."""
-        self._config_entries.pop(config_entry.entry_id)
-        device_ids = self._entries_devices[config_entry.entry_id]
-        for device_id in device_ids:
+        for device_id in self._managed_devices.keys():
             self._managed_devices.pop(device_id)
             self._devices_entities.pop(device_id)
+
+
+class GlobalDataManager:
+
+    _hass: HomeAssistant = None
+    _entry: ConfigEntry = None
+    _session: AiotCloud = None
+    _aiot_manager: AiotManager = None
+
+    @property
+    def hass(self) -> HomeAssistant:
+        return self._hass
+
+    @property
+    def entry(self) -> ConfigEntry:
+        """插件配置的entry对象"""
+        return self._entry
+
+    @property
+    def entry_data(self) -> dict:
+        return self.entry.data.copy()
+
+    def set_entry(self, entry: ConfigEntry):
+        self._entry = entry
+
+    @property
+    def session(self) -> AiotCloud:
+        """TCP会话"""
+        return self._session
+
+    @property
+    def aiot_manager(self) -> AiotManager:
+        return self._aiot_manager
+
+    def init_data(self, hass):
+        if self.hass is not None:
+            return
+
+        self._hass = hass
+        # self._hass.data.setdefault(DOMAIN, {})  # 这里先预留
+        self._session = AiotCloud(aiohttp_client.async_create_clientsession(self.hass))
+        self._session.update_token_event_callback = self.entry_update_token
+        self._aiot_manager = AiotManager()
+
+    def create_token_data(
+        self, account: str, account_type: int, country_code: str, token_result: dict
+    ):
+        data = {}
+        data[CONF_ENTRY_AUTH_ACCOUNT] = account
+        data[CONF_ENTRY_AUTH_ACCOUNT_TYPE] = account_type
+        data[CONF_ENTRY_AUTH_COUNTRY_CODE] = country_code
+        data[CONF_ENTRY_AUTH_OPENID] = token_result["openId"]
+        data[CONF_ENTRY_AUTH_ACCESS_TOKEN] = token_result["accessToken"]
+        data[CONF_ENTRY_AUTH_EXPIRES_IN] = token_result["expiresIn"]
+        data[CONF_ENTRY_AUTH_EXPIRES_TIME] = (
+            datetime.datetime.now()
+            + datetime.timedelta(seconds=int(token_result["expiresIn"]))
+        ).strftime("%Y-%m-%d %H:%M:%S")
+        data[CONF_ENTRY_AUTH_REFRESH_TOKEN] = token_result["refreshToken"]
+        return data
+
+    def session_update_token(
+        self, access_token: str, refresh_token: str, country_code: str = None
+    ):
+        if country_code:
+            self.session.set_country(country_code)
+        self.session.access_token = access_token
+        self.session.refresh_token = refresh_token
+
+    def entry_update_token(self, token_result: dict):
+        if self.entry:
+            data = self.entry.data.copy()
+            data[CONF_ENTRY_AUTH_ACCESS_TOKEN] = token_result["accessToken"]
+            data[CONF_ENTRY_AUTH_EXPIRES_IN] = token_result["expiresIn"]
+            data[CONF_ENTRY_AUTH_EXPIRES_TIME] = (
+                datetime.datetime.now()
+                + datetime.timedelta(seconds=int(token_result["expiresIn"]))
+            ).strftime("%Y-%m-%d %H:%M:%S")
+            data[CONF_ENTRY_AUTH_REFRESH_TOKEN] = token_result["refreshToken"]
+            self.hass.config_entries.async_update_entry(self.entry, data=data)
+
+    async def async_refresh_token(
+        self, refresh_token: str = None, force_refresh_token=False
+    ):
+        """
+        刷新令牌
+        refresh_token：指定refresh token刷新，若指定该参数，则force_refresh_token无用
+        force_refresh_token：表示是否强制刷新令牌，如果为False，当令牌没有过期时，则不刷新
+        """
+        data = self.entry.data.copy()
+        resp = None
+        if refresh_token:
+            resp = await self.session.async_refresh_token(refresh_token)
+        else:
+            if force_refresh_token:
+                resp = await self.session.async_refresh_token(
+                    data.get(CONF_ENTRY_AUTH_REFRESH_TOKEN)
+                )
+            else:
+                if (
+                    datetime.datetime.strptime(
+                        data.get(CONF_ENTRY_AUTH_EXPIRES_TIME), "%Y-%m-%d %H:%M:%S"
+                    )
+                    <= datetime.datetime.now()
+                ):
+                    resp = await self.session.async_refresh_token(
+                        data.get(CONF_ENTRY_AUTH_REFRESH_TOKEN)
+                    )
+
+        if resp and resp["code"] == 0:
+            self.entry_update_token(resp["result"])
+            return True
+        else:
+            return False
+
+
+GLOBAL_DATA_MANAGER = GlobalDataManager()
